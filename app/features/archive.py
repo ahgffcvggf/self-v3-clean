@@ -98,18 +98,24 @@ async def pv_archive_incoming_handler(client, message):
     if media_obj is not None and file_size <= MAX_CACHE_FILE_BYTES:
         acc_dir = os.path.join(PRIVATE_CACHE_DIR, str(owner_id)); os.makedirs(acc_dir, exist_ok=True)
         try:
-            downloaded = await client.download_media(message, file_name=os.path.join(acc_dir, f"{message.chat.id}_{message.id}_"))
+            extension = '.jpg' if 'عکس' in msg_type else '.mp4' if 'فیلم' in msg_type or msg_type == 'ویدیو مسیج' else '.ogg' if msg_type == 'ویس' else '.bin'
+            downloaded = await client.download_media(message, file_name=os.path.join(acc_dir, f"{message.chat.id}_{message.id}{extension}"))
             if downloaded and os.path.isfile(downloaded): media_path, actual_size = downloaded, os.path.getsize(downloaded)
         except Exception as exc: logging.warning("Media cache download failed (%s): %s", message.id, exc)
     if media_obj is not None and file_size > MAX_CACHE_FILE_BYTES: text_content = (text_content + f"\n[فایل بیش از سقف کش: {file_size // (1024*1024)} MB]").strip()
     if is_timed:
         header = _format_header("⏳ ذخیرهٔ خودکار محتوای تایم‌دار", sender_name, sender.username or "", sender.id, msg_type, datetime.now(TEHRAN_TIMEZONE).strftime("%H:%M:%S"))
-        try: await _send_archived_item(client, header, msg_type, text_content, media_path)
-        finally:
-            if media_path and os.path.isfile(media_path):
-                try: os.remove(media_path)
-                except OSError: pass
-        data_manager.upsert_pv_cache(owner_id, message.chat.id, message.id, sender.id, sender_name, sender.username or "", msg_type, text_content, None, 0, True, "ARCHIVED"); return
+        data_manager.upsert_pv_cache(owner_id, message.chat.id, message.id, sender.id, sender_name, sender.username or "", msg_type, text_content, media_path, actual_size, True, "PENDING")
+        try:
+            await _send_archived_item(client, header, msg_type, text_content, media_path)
+        except Exception:
+            logging.warning("Timed media delivery failed; preserving pending archive")
+            return
+        data_manager.mark_archive_success(owner_id, message.chat.id, message.id)
+        if media_path and os.path.isfile(media_path):
+            try: os.remove(media_path)
+            except OSError: pass
+        return
     data_manager.upsert_pv_cache(owner_id, message.chat.id, message.id, sender.id, sender_name, sender.username or "", msg_type, text_content, media_path, actual_size); data_manager.enforce_cache_limits()
 
 
