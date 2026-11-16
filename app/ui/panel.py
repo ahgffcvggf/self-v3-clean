@@ -7,11 +7,11 @@ from pyrogram.types import (
     InlineQueryResultArticle, InputTextMessageContent
 )
 from app.config import (
-    AI_API_KEY, FONT_KEYS_ORDER, PANEL_PHOTO_PATH, UI_DIVIDER,
+    AI_API_KEY, AI_API_URL, AI_MODEL, FONT_KEYS_ORDER, PANEL_PHOTO_PATH, UI_DIVIDER,
     panel_text, ui_err, ui_status, ui_toggle, ui_warn
 )
 from app.features.activity import keep_online_task
-from app.features.clock import bio_update_task, perform_clock_update_now, stylize_time
+from app.features.clock import bio_update_task, perform_clock_update_now, restore_clock_lastname, stylize_time
 from app.state import (
     ACTIVE_BOTS, AI_ASSISTANT_STATUS, ANTI_DELETE_STATUS,
     AUTO_TRANSLATE_TARGET, BIO_DATE_FORMAT, BIO_TIME_STATUS, BIO_UPDATE_TASKS,
@@ -43,8 +43,7 @@ HELP_SECTIONS = [
         "• `.id` یا `.ایدی` — اطلاعات خودتان یا فرد ریپلای‌شده + تخمین زمان ساخت\n"
         "• `.ping` یا `.پینگ` — پینگ تلگرام و مشخصات CPU/RAM سرور\n"
         "• `.ویس [متن]` یا ریپلای `.ویس` — تبدیل متن به ویس فارسی\n"
-        "• `.اهنگ [نام]` / `.آهنگ [نام]` — به زودی تکمیل می‌شود\n"
-        "• `ساخت ورد [توضیح]` / `ساخت پی دی اف [توضیح]`"
+        "• `.اهنگ [نام]` / `.آهنگ [نام]` — در دسترس نیست"
     ),
     (
         "ذخیره پیوی و حالت‌های خودکار",
@@ -77,7 +76,7 @@ CATEGORY_META = {
     "archive": ("ذخیره پیوی (آنتی‌حذف + تایم‌دار)", "آرشیو پیام‌های حذف‌شده و عکس/فیلم تایم‌دار در پیوی اشخاص."),
     "ai": ("دستیار هوش مصنوعی (.ربات)", "پاسخ‌گویی فقط به پیام‌های خودتان با پیشوند .ربات"),
     "lang": ("ترجمه خودکار", "ترجمه خودکار پیام‌های ارسالی عادی (فرمان‌ها ترجمه نمی‌شوند)."),
-    "voice": ("موسیقی و صدا", "تنظیم صدای ویس فارسی (.ویس) و وضعیت دانلود آهنگ."),
+    "voice": ("صدا", "تنظیم صدای ویس فارسی (.ویس)."),
     "format": ("ظاهر پیام‌ها و ابزارها", "استایل پیام‌های ارسالی و راهنمای .id / .ping."),
     "account": ("وضعیت حساب و سرویس", "خلاصه وضعیت اتصال و تنظیمات فعال."),
 }
@@ -114,7 +113,7 @@ def generate_category_menu(user_id: int, category: str) -> InlineKeyboardMarkup:
         c_on = CLOCK_STATUS.get(user_id, True)
         b_on = BIO_TIME_STATUS.get(user_id, False)
         fmt = BIO_DATE_FORMAT.get(user_id)
-        fmt_label = {"jalali": "شمسی", "gregorian": "میلادی", None: "خاموش"}[fmt]
+        fmt_label = {"jalali": "شمسی", "gregorian": "میلادی", None: "خاموش"}.get(fmt, "خاموش")
         preview = stylize_time("12:34", USER_FONT_CHOICES.get(user_id, "stylized"))
         return InlineKeyboardMarkup([
             [btn(f"ساعت نام {ui_status(c_on)}", f"toggle_clock_{user_id}", toggle_style(c_on)),
@@ -167,7 +166,6 @@ def generate_category_menu(user_id: int, category: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [btn(f"صدای زن (دلارا) {ui_status(gender == 'female')}", f"voice_female_{user_id}", toggle_style(gender == "female")),
              btn(f"صدای مرد (فرید) {ui_status(gender == 'male')}", f"voice_male_{user_id}", toggle_style(gender == "male"))],
-            [btn("🎵 دانلود آهنگ: به زودی", f"noop_{user_id}")],
             [back_btn],
         ])
 
@@ -205,11 +203,12 @@ def generate_panel_view(user_id: int, category: str):
             f"کش فعلی: `{cnt}` مورد (`{mb:.2f} MB` / سقف 1 GB)",
         ]
     elif category == "ai":
-        cfg = "متصل" if AI_API_KEY else "تنظیم‌نشده"
-        lines = [f"پیکربندی API: {cfg}", "فرمان فعال: `.ربات <سؤال>` (فقط پیام خودتان)"]
+        configured = bool(AI_API_KEY and AI_API_URL and AI_MODEL)
+        cfg = "پیکربندی‌شده" if configured else "تنظیم‌نشده"
+        lines = [f"پیکربندی API: {cfg}", "وضعیت اجرا: فقط هنگام پاسخ‌گویی زنده مشخص می‌شود.", "فرمان فعال: `.ربات <سؤال>` (فقط پیام خودتان)"]
     elif category == "voice":
         gender_lbl = "زن (دلارا)" if TTS_VOICE_GENDER.get(user_id, "female") == "female" else "مرد (فرید)"
-        lines = [f"صدای فعلی `.ویس`: {gender_lbl}", "فرمان `.اهنگ`: به زودی تکمیل می‌شود"]
+        lines = [f"صدای فعلی `.ویس`: {gender_lbl}", "فرمان آهنگ در دسترس نیست."]
     elif category == "format":
         lines = ["دستورات اطلاعاتی: `.id` / `.ایدی` و `.ping` / `.پینگ`"]
     elif category == "account":
@@ -365,16 +364,20 @@ def register_manager_panel_handlers(manager_bot):
             if target_user_id in ACTIVE_BOTS:
                 bot_c = ACTIVE_BOTS[target_user_id][0]
                 if val:
-                    asyncio.create_task(perform_clock_update_now(bot_c, target_user_id))
+                    await perform_clock_update_now(bot_c, target_user_id)
+                else:
+                    await restore_clock_lastname(bot_c, target_user_id)
         elif action == "cycle_font":
             cur = USER_FONT_CHOICES.get(target_user_id, "stylized")
+            if cur not in FONT_KEYS_ORDER:
+                cur = FONT_KEYS_ORDER[0]
             new_font = FONT_KEYS_ORDER[(FONT_KEYS_ORDER.index(cur) + 1) % len(FONT_KEYS_ORDER)]
             USER_FONT_CHOICES[target_user_id] = new_font
             CLOCK_STATUS[target_user_id] = True
             settings_update.update({"font": new_font, "clock": True})
             category = "time"
             if target_user_id in ACTIVE_BOTS:
-                asyncio.create_task(perform_clock_update_now(ACTIVE_BOTS[target_user_id][0], target_user_id))
+                await perform_clock_update_now(ACTIVE_BOTS[target_user_id][0], target_user_id)
         elif action == "toggle_biotime":
             val = not BIO_TIME_STATUS.get(target_user_id, False)
             BIO_TIME_STATUS[target_user_id] = val
@@ -390,6 +393,8 @@ def register_manager_panel_handlers(manager_bot):
         elif action == "cycle_dateformat":
             order = ["jalali", "gregorian", None]
             cur = BIO_DATE_FORMAT.get(target_user_id)
+            if cur not in order:
+                cur = None
             new_fmt = order[(order.index(cur) + 1) % 3]
             BIO_DATE_FORMAT[target_user_id] = new_fmt
             settings_update["bio_date_format"] = new_fmt

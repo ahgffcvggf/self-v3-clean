@@ -1,173 +1,157 @@
+"""AI assistant handlers with bounded, private service integration."""
+import asyncio
 import json
 import logging
-import os
 import re
 import time
+from collections import defaultdict, deque
+from urllib.parse import urlparse
+
 import aiohttp
 from pyrogram.enums import ChatAction, ParseMode
-from app.config import (
-    AI_API_KEY, AI_API_URL, AI_MODEL, AI_SYSTEM_PROMPT,
-    PERSIAN_FONT_PATH, WORK_DIR, ui_toggle, ui_warn
-)
+
+from app.config import AI_API_KEY, AI_API_URL, AI_MODEL, AI_SYSTEM_PROMPT, ui_toggle
 from app.state import AI_ASSISTANT_STATUS, record_generated_message, safe_call
 from app.storage.db import data_manager
 
-try:
-    from docx import Document
-except ImportError:
-    Document = None
-
-try:
-    from fpdf import FPDF
-except ImportError:
-    FPDF = None
-
-try:
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-    _PERSIAN_SHAPING_AVAILABLE = True
-except ImportError:
-    _PERSIAN_SHAPING_AVAILABLE = False
+log = logging.getLogger(__name__)
+MAX_AI_INPUT_CHARS = 12_000
+MAX_AI_REPLY_CHARS = 100_000
+TELEGRAM_TEXT_LIMIT = 4096
+AI_MAX_CONCURRENT_PER_ACCOUNT = 2
+AI_RATE_WINDOW_SECONDS = 60.0
+AI_MAX_REQUESTS_PER_WINDOW = 10
+_account_semaphores = defaultdict(lambda: asyncio.Semaphore(AI_MAX_CONCURRENT_PER_ACCOUNT))
+_rate_history = defaultdict(deque)
+_rate_lock = asyncio.Lock()
 
 
-async def get_ai_reply(
-    user_message: str,
-    replied_message: str = None,
-    client=None,
-    account_id: int = None,
-    chat_id: int = None,
-    save_history: bool = True,
-):
-    if not AI_API_KEY or not AI_API_URL or not AI_MODEL:
-        logging.warning("تنظیمات AI_API_KEY / AI_API_URL / AI_MODEL کامل نیست.")
+def _valid_https_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    return parsed.scheme == "https" and bool(parsed.netloc)
+
+
+def _chunks(text: str, limit: int = TELEGRAM_TEXT_LIMIT):
+    """Split without exceeding Telegram's limit, preferring newline/space boundaries."""
+    text = str(text)
+    while text:
+        if len(text) <= limit:
+            yield text
+            return
+        cut = text.rfind("\n", 0, limit + 1)
+        if cut < max(1, limit // 2):
+            cut = text.rfind(" ", 0, limit + 1)
+        if cut < 1:
+            cut = limit
+        yield text[:cut]
+        text = text[cut:]
+        if text.startswith(("\n", " ")):
+            text = text[1:]
+
+
+async def _take_rate_slot(account_id):
+    key = account_id if account_id is not None else "global"
+    now = time.monotonic()
+    async with _rate_lock:
+        history = _rate_history[key]
+        while history and now - history[0] >= AI_RATE_WINDOW_SECONDS:
+            history.popleft()
+        if len(history) >= AI_MAX_REQUESTS_PER_WINDOW:
+            return False
+        history.append(now)
+        return True
+
+
+def _extract_response(raw_body: str, content_type: str) -> str:
+    if "text/event-stream" in content_type or raw_body.lstrip().startswith("data:"):
+        pieces = []
+        for line in raw_body.splitlines():
+            if not line.strip().startswith("data:"):
+                continue
+            item = line.strip()[5:].strip()
+            if not item or item == "[DONE]":
+                continue
+            try:
+                choice = json.loads(item).get("choices", [{}])[0]
+                pieces.append(choice.get("delta", {}).get("content") or choice.get("message", {}).get("content") or "")
+            except (ValueError, KeyError, IndexError, TypeError):
+                continue
+        return "".join(pieces).strip()
+    data = json.loads(raw_body)
+    return str(data["choices"][0]["message"]["content"]).strip()
+
+
+async def get_ai_reply(user_message: str, replied_message: str = None, client=None,
+                      account_id: int = None, chat_id: int = None, save_history: bool = True):
+    """Return an answer; history is read only. Persistence happens after delivery."""
+    if not user_message or len(user_message) > MAX_AI_INPUT_CHARS:
         return None
-    if not user_message:
+    if not AI_API_KEY or not AI_API_URL or not AI_MODEL or not _valid_https_url(AI_API_URL):
+        log.warning("AI configuration is incomplete or not HTTPS")
         return None
-
-    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
-
-    if account_id is not None and chat_id is not None and save_history:
-        history = data_manager.get_chat_history(account_id, chat_id, limit=8)
-        for msg_type, content in history:
-            role = "user" if msg_type == "user" else "assistant"
-            messages.append({"role": role, "content": content})
-
-    if replied_message:
-        messages.append({"role": "user", "content": f"پیام ریپلای‌شده:\n{replied_message}"})
-
-    messages.append({"role": "user", "content": user_message})
-
-    headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": AI_MODEL,
-        "messages": messages,
-        "max_tokens": 1200,
-        "stream": False,
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                AI_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as response:
-                raw_body = await response.text()
-                if response.status != 200:
-                    logging.error(f"خطای API دستیار AI ({response.status}): {raw_body[:500]}")
-                    return None
-
-                content_type = response.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type or raw_body.lstrip().startswith("data:"):
-                    full_text = ""
-                    for line in raw_body.splitlines():
-                        line = line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        chunk = line[5:].strip()
-                        if chunk == "[DONE]" or not chunk:
-                            continue
-                        try:
-                            chunk_json = json.loads(chunk)
-                            delta = chunk_json["choices"][0]
-                            piece = (
-                                delta.get("delta", {}).get("content")
-                                or delta.get("message", {}).get("content")
-                                or ""
-                            )
-                            full_text += piece
-                        except Exception:
-                            continue
-                    result = full_text.strip()
-                else:
-                    data = json.loads(raw_body)
-                    result = data["choices"][0]["message"]["content"].strip()
-
-                if result and account_id is not None and chat_id is not None and save_history:
-                    data_manager.save_chat_message(account_id, chat_id, "user", user_message)
-                    data_manager.save_chat_message(account_id, chat_id, "ai", result)
-                return result or None
-    except Exception as e:
-        logging.error(f"خطا در ارتباط با API دستیار AI: {type(e).__name__}: {e}")
+    if not await _take_rate_slot(account_id):
         return None
+    key = account_id if account_id is not None else "global"
+    async with _account_semaphores[key]:
+        messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+        if account_id is not None and chat_id is not None and save_history:
+            for msg_type, content in data_manager.get_chat_history(account_id, chat_id, limit=8):
+                messages.append({"role": "user" if msg_type == "user" else "assistant", "content": content})
+        if replied_message:
+            messages.append({"role": "user", "content": f"پیام ریپلای‌شده:\n{replied_message[:MAX_AI_INPUT_CHARS]}"})
+        messages.append({"role": "user", "content": user_message})
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(AI_API_URL, headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+                                        json={"model": AI_MODEL, "messages": messages, "max_tokens": 1200, "stream": False}, timeout=timeout) as response:
+                    if response.status != 200:
+                        log.error("AI service returned HTTP %s", response.status)
+                        return None
+                    result = _extract_response(await response.text(), response.headers.get("Content-Type", ""))
+                    return result[:MAX_AI_REPLY_CHARS] or None
+        except Exception:
+            log.exception("AI service request failed")
+            return None
+
+
+async def _persist_delivered(account_id, chat_id, user_message, answer):
+    if account_id is not None and chat_id is not None and answer:
+        data_manager.save_chat_message(account_id, chat_id, "user", user_message)
+        data_manager.save_chat_message(account_id, chat_id, "ai", answer)
 
 
 async def ai_robot_command_handler(client, message):
-    """
-    فقط پیام‌های خود صاحب اکانت که دقیقاً با `.ربات` شروع شوند پردازش می‌شوند.
-    `ربات ...` یا `.رباتی` یا وجود `.ربات` در وسط جمله نادیده گرفته می‌شود.
-    """
     owner_id = client.me.id
-    if not AI_ASSISTANT_STATUS.get(owner_id, False):
+    if not AI_ASSISTANT_STATUS.get(owner_id, False) or not message.text:
         return
-    if not message.text:
+    match = re.match(r"^\.ربات(?:\s+(.*))?$", message.text.strip(), re.DOTALL)
+    if not match:
         return
-
-    text = message.text.strip()
-    m = re.match(r"^\.ربات(?:\s+(.*))?$", text, re.DOTALL)
-    if not m:
-        return
-
-    query = (m.group(1) or "").strip()
+    query = (match.group(1) or "").strip()
     if not query:
-        sent = await safe_call(
-            message.reply_text,
-            "🤖 برای پرسیدن سؤال، متن را بعد از دستور بنویسید.\nمثال: <code>.ربات امروز هوا چطوره؟</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        if sent:
-            record_generated_message(owner_id, message.chat.id, sent.id)
+        sent = await safe_call(message.reply_text, "🤖 برای پرسیدن سؤال، متن را بعد از دستور بنویسید.", parse_mode=ParseMode.HTML)
+        if sent: record_generated_message(owner_id, message.chat.id, sent.id)
         return
-
-    try:
-        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-
-    replied_text = None
+    try: await client.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception: pass
+    replied = None
     if message.reply_to_message:
-        replied_text = message.reply_to_message.text or message.reply_to_message.caption
-
-    reply = await get_ai_reply(
-        query,
-        replied_message=replied_text,
-        client=client,
-        account_id=owner_id,
-        chat_id=message.chat.id,
-        save_history=True,
-    )
-    if reply:
-        sent = await safe_call(message.reply_text, reply)
-        if sent:
-            record_generated_message(owner_id, message.chat.id, sent.id)
-    else:
-        sent = await safe_call(message.reply_text, "❌ پاسخی از سرویس AI دریافت نشد.")
-        if sent:
-            record_generated_message(owner_id, message.chat.id, sent.id)
+        replied = message.reply_to_message.text or message.reply_to_message.caption
+    answer = await get_ai_reply(query, replied, client, owner_id, message.chat.id)
+    if not answer:
+        sent = await safe_call(message.reply_text, "❌ سرویس AI در دسترس نیست یا درخواست محدود شده است.")
+        if sent: record_generated_message(owner_id, message.chat.id, sent.id)
+        return
+    delivered = True
+    for part in _chunks(answer):
+        sent = await safe_call(message.reply_text, part)
+        if not sent:
+            delivered = False
+            break
+        record_generated_message(owner_id, message.chat.id, sent.id)
+    if delivered:
+        await _persist_delivered(owner_id, message.chat.id, query, answer)
 
 
 async def ai_assistant_toggle_handler(client, message):
@@ -179,104 +163,6 @@ async def ai_assistant_toggle_handler(client, message):
 
 
 async def ai_test_handler(client, message):
-    try:
-        await message.edit_text("⏳ در حال تست اتصال دستیار AI...")
-        reply = await get_ai_reply("سلام، فقط یک جمله کوتاه بنویس.", save_history=False)
-        if reply:
-            await message.edit_text(f"✅ سرویس AI متصل است:\n{reply}")
-        else:
-            await message.edit_text("❌ سرویس AI پاسخ نداد؛ تنظیمات API را بررسی کنید.")
-    except Exception as e:
-        await message.edit_text(f"❌ خطا در تست AI: {type(e).__name__}: {e}")
-
-
-def _shape_persian(text: str) -> str:
-    if not _PERSIAN_SHAPING_AVAILABLE:
-        return text
-    try:
-        return get_display(arabic_reshaper.reshape(text))
-    except Exception:
-        return text
-
-
-async def create_word_file_handler(client, message):
-    instruction = message.text.split("ساخت ورد ", 1)[1].strip() if "ساخت ورد " in message.text else ""
-    if Document is None:
-        await safe_call(message.reply_text, "❌ کتابخانه `python-docx` نصب نیست.")
-        return
-    if not instruction:
-        await safe_call(message.reply_text, ui_warn("توضیح فایل ورد را بنویسید. مثال: `ساخت ورد گزارش هوش مصنوعی`"))
-        return
-
-    await safe_call(message.edit_text, "⏳ در حال ساخت فایل Word...")
-    content = await get_ai_reply(
-        f"متن کامل و نهایی زیر را برای فایل Word آماده کن (بدون Markdown اضافه):\n{instruction}",
-        save_history=False,
-    )
-    if not content:
-        await safe_call(message.reply_text, "❌ محتوایی از AI دریافت نشد.")
-        return
-
-    doc = Document()
-    for line in content.split("\n"):
-        doc.add_paragraph(line)
-
-    output_path = os.path.join(WORK_DIR, f"word_{client.me.id}_{int(time.time())}.docx")
-    try:
-        doc.save(output_path)
-        sent = await safe_call(client.send_document, message.chat.id, output_path, caption="✅ فایل Word ساخته شد.")
-        if sent:
-            record_generated_message(client.me.id, message.chat.id, sent.id)
-    finally:
-        if os.path.isfile(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-
-
-async def create_pdf_file_handler(client, message):
-    instruction = message.text.split("ساخت پی دی اف ", 1)[1].strip() if "ساخت پی دی اف " in message.text else ""
-    if FPDF is None:
-        await safe_call(message.reply_text, "❌ کتابخانه `fpdf2` نصب نیست.")
-        return
-    if not instruction:
-        await safe_call(message.reply_text, ui_warn("توضیح فایل PDF را بنویسید. مثال: `ساخت پی دی اف خلاصه معماری کامپیوتر`"))
-        return
-
-    await safe_call(message.edit_text, "⏳ در حال ساخت فایل PDF...")
-    content = await get_ai_reply(
-        f"متن کامل و نهایی زیر را برای فایل PDF آماده کن (بدون Markdown اضافه):\n{instruction}",
-        save_history=False,
-    )
-    if not content:
-        await safe_call(message.reply_text, "❌ محتوایی از AI دریافت نشد.")
-        return
-
-    pdf = FPDF()
-    pdf.add_page()
-    use_persian_font = os.path.isfile(PERSIAN_FONT_PATH)
-    if not use_persian_font:
-        await safe_call(message.reply_text, ui_warn("فونت فارسی Vazirmatn-Regular.ttf یافت نشد؛ خروجی PDF ممکن است حروف فارسی را درست نمایش ندهد."))
-    if use_persian_font:
-        pdf.add_font("Vazir", "", PERSIAN_FONT_PATH, uni=True)
-        pdf.set_font("Vazir", size=13)
-    else:
-        pdf.set_font("Arial", size=12)
-
-    for line in content.split("\n"):
-        display_line = _shape_persian(line) if use_persian_font else line
-        pdf.multi_cell(0, 8, display_line, align="R" if use_persian_font else "L")
-
-    output_path = os.path.join(WORK_DIR, f"pdf_{client.me.id}_{int(time.time())}.pdf")
-    try:
-        pdf.output(output_path)
-        sent = await safe_call(client.send_document, message.chat.id, output_path, caption="✅ فایل PDF ساخته شد.")
-        if sent:
-            record_generated_message(client.me.id, message.chat.id, sent.id)
-    finally:
-        if os.path.isfile(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
+    await message.edit_text("⏳ در حال تست اتصال دستیار AI...")
+    answer = await get_ai_reply("سلام، فقط یک جمله کوتاه بنویس.", save_history=False)
+    await message.edit_text(f"✅ سرویس AI متصل است:\n{answer}" if answer else "❌ سرویس AI پاسخ نداد؛ تنظیمات API را بررسی کنید.")

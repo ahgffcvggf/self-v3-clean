@@ -1,13 +1,8 @@
-kurigram
-tgcrypto
-aiohttp
-psutil
-persiantools
-tzdata
-edge-tts
-
-# ساخت فایل Word / PDF با AI
-python-docx
-fpdf2
-arabic-reshaper
-python-bidi
+kurigram==2.2.27
+tgcrypto==1.2.5
+aiohttp==3.14.5
+psutil==7.2.2
+persiantools==6.2.0
+tzdata==2026.6
+edge-tts==7.3.1
+cryptography==50.0.2

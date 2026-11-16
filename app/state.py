@@ -45,6 +45,13 @@ AUTO_REACTION_TARGETS = {}
 # ثبت شناسه پیام‌های تولیدشده توسط ربات (جلوگیری از حلقه AI/ترجمه/آرشیو)
 GENERATED_MSG_IDS = {}
 
+
+def clear_runtime_state(user_id: int):
+    """Remove all in-memory settings and task references for an erased user."""
+    for name, value in list(globals().items()):
+        if name.isupper() and isinstance(value, dict):
+            value.pop(user_id, None)
+
 def record_generated_message(account_id: int, chat_id: int, message_id: int):
     buf = GENERATED_MSG_IDS.setdefault(account_id, deque(maxlen=500))
     key = (chat_id, message_id)

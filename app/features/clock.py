@@ -13,6 +13,8 @@ from app.state import (
 )
 from app.storage.db import data_manager
 
+_CLOCK_ORIGINAL_LASTNAMES = {}
+
 
 def stylize_time(time_str: str, style: str) -> str:
     font_map = FONT_STYLES.get(style, FONT_STYLES["stylized"])
@@ -25,7 +27,8 @@ async def perform_clock_update_now(client, user_id: int):
             style = USER_FONT_CHOICES.get(user_id, "stylized")
             me = await client.get_me()
             current_lastname = me.last_name or ""
-            base_name = re.sub(r"(?:\s*" + CLOCK_CHARS_REGEX_CLASS + r"+)+$", "", current_lastname).strip()
+            _CLOCK_ORIGINAL_LASTNAMES.setdefault(user_id, current_lastname)
+            base_name = _CLOCK_ORIGINAL_LASTNAMES[user_id]
             now_str = datetime.now(TEHRAN_TIMEZONE).strftime("%H:%M")
             new_lastname = f"{base_name} {stylize_time(now_str, style)}".strip()
             if new_lastname != current_lastname:
@@ -53,7 +56,7 @@ async def bio_update_task(client, user_id: int):
             stylized = stylize_time(now.strftime("%H:%M"), style)
             date_fmt = BIO_DATE_FORMAT.get(user_id)
             if date_fmt == "jalali":
-                current_date = JalaliDate.today().strftime("امروز (%d) %B ☀️ %Y")
+                current_date = JalaliDate(now.date()).strftime("امروز (%d) %B ☀️ %Y")
             elif date_fmt == "gregorian":
                 current_date = now.strftime("امروز (%d) %B ☀️ %Y")
             else:
@@ -93,16 +96,17 @@ async def lastname_time_toggle_handler(client, message):
         CLOCK_STATUS[user_id] = is_on
         data_manager.update_user_data(user_id, {"settings": {"clock": is_on}})
         if is_on:
-            asyncio.create_task(perform_clock_update_now(client, user_id))
+            await perform_clock_update_now(client, user_id)
         else:
-            try:
-                me = await client.get_me()
-                current_lastname = me.last_name or ""
-                clean_name = re.sub(r"(?:\s*" + CLOCK_CHARS_REGEX_CLASS + r"+)+$", "", current_lastname).strip()
-                await client.update_profile(last_name=clean_name)
-            except Exception:
-                pass
+            await restore_clock_lastname(client, user_id)
         await message.edit_text(ui_toggle("ساعت روی نام", is_on))
+
+
+async def restore_clock_lastname(client, user_id):
+    original = _CLOCK_ORIGINAL_LASTNAMES.get(user_id)
+    if original is not None:
+        await client.update_profile(last_name=original)
+        _CLOCK_ORIGINAL_LASTNAMES.pop(user_id, None)
 
 
 async def set_bio_text_handler(client, message):

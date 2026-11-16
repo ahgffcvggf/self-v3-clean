@@ -11,7 +11,7 @@ from app.features.activity import (
 )
 from app.features.ai import (
     ai_assistant_toggle_handler, ai_robot_command_handler,
-    ai_test_handler, create_pdf_file_handler, create_word_file_handler
+    ai_test_handler,
 )
 from app.features.archive import (
     pv_archive_deleted_handler, pv_archive_edited_handler, pv_archive_incoming_handler,
@@ -34,7 +34,7 @@ from app.features.tools import (
     set_comment_text_handler, show_currency_prices_handler
 )
 from app.features.voice import music_placeholder_handler, voice_command_handler
-from app.manager.bot import create_manager_bot, god_mode_handler, register_manager_handlers
+from app.manager.bot import create_manager_bot, god_mode_handler, register_manager_handlers, stop_active_bot, cache_cleanup_loop
 from app.state import (
     ACTIVE_BOTS, ACTIVE_ENEMIES, BIO_TIME_STATUS, BIO_UPDATE_TASKS,
     CLOCK_STATUS, GLOBAL_ENEMY_STATUS, ONLINE_MODE_STATUS,
@@ -60,24 +60,34 @@ def patch_peer_id_validation():
     pyrogram.utils.get_peer_type = patched_get_peer_type
 
 
-patch_peer_id_validation()
-load_all_states(data_manager)
-manager_bot = create_manager_bot()
+manager_bot = None
+_start_locks = {}
 
 
 async def start_bot_instance(session_string: str, phone: str, user_id: int):
-    client = Client(f"bot_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+    lock = _start_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        return await _start_bot_instance(session_string, phone, user_id)
+
+
+async def _start_bot_instance(session_string: str, phone: str, user_id: int):
+    if user_id in ACTIVE_BOTS:
+        await stop_active_bot(user_id)
+    client = Client(f"bot_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session_string, in_memory=True)
     try:
         await client.start()
-        user_id = (await client.get_me()).id
-    except Exception as e:
-        logging.error(f"Failed to start bot for {phone}: {e}")
-        return
-
-    if user_id in ACTIVE_BOTS:
-        _, old_tasks = ACTIVE_BOTS.pop(user_id)
-        for t in old_tasks:
-            t.cancel()
+        if (await client.get_me()).id != user_id:
+            raise ValueError("Session identity does not match account")
+    except BaseException:
+        if getattr(client, "is_connected", False):
+            try:
+                if getattr(client, "is_initialized", False):
+                    await client.stop()
+                else:
+                    await client.disconnect()
+            except Exception:
+                logging.warning("Could not clean up failed account connection")
+        raise
 
     # حفظ تنظیمات ذخیره‌شده از دیتابیس (رفع باگ بازنویسی فونت و ساعت در ری‌استارت)
     saved_settings = data_manager.get_user_data(user_id).get("settings", {})
@@ -98,7 +108,9 @@ async def start_bot_instance(session_string: str, phone: str, user_id: int):
 
     # ۴. پنل، راهنما و دستورات جدید
     client.add_handler(MessageHandler(help_command_controller, filters.me & filters.regex(r"^راهنما$")))
-    client.add_handler(MessageHandler(lambda c, m: panel_command_controller(c, m, manager_bot), filters.me & filters.regex(r"^(پنل|panel)$")))
+    async def panel_handler(c, m):
+        await panel_command_controller(c, m, manager_bot)
+    client.add_handler(MessageHandler(panel_handler, filters.me & filters.regex(r"^(پنل|panel)$")))
     client.add_handler(MessageHandler(ai_robot_command_handler, filters.me & filters.text & filters.regex(r"^\.ربات(?:\s|$)")), group=0)
     client.add_handler(MessageHandler(id_command_handler, filters.me & filters.text & filters.regex(r"^\.(?:id|ایدی)$", flags=0)))
     client.add_handler(MessageHandler(ping_command_handler, filters.me & filters.text & filters.regex(r"^\.(?:ping|پینگ)$", flags=0)))
@@ -120,8 +132,7 @@ async def start_bot_instance(session_string: str, phone: str, user_id: int):
     client.add_handler(MessageHandler(pv_archive_toggle_handler, filters.me & filters.regex(r"^(ذخیره پیوی|آنتی حذف) (روشن|خاموش)$")))
     client.add_handler(MessageHandler(ai_assistant_toggle_handler, filters.me & filters.regex(r"^دستیار (روشن|خاموش)$")))
     client.add_handler(MessageHandler(ai_test_handler, filters.me & filters.regex(r"^تست هوش مصنوعی$")))
-    client.add_handler(MessageHandler(create_word_file_handler, filters.me & filters.regex(r"^ساخت ورد .+$")))
-    client.add_handler(MessageHandler(create_pdf_file_handler, filters.me & filters.regex(r"^ساخت پی دی اف .+$")))
+
 
     client.add_handler(MessageHandler(restart_command_handler, filters.me & filters.regex(r"^(ریستارت|ریس|/restart)$")))
     client.add_handler(MessageHandler(online_mode_toggle_handler, filters.me & filters.regex(r"^آنلاین (روشن|خاموش)$")))
@@ -181,18 +192,43 @@ async def start_bot_instance(session_string: str, phone: str, user_id: int):
 
 
 async def main():
+    global manager_bot
     if not API_ID or not API_HASH or not BOT_TOKEN:
-        logging.error("API_ID / API_HASH / BOT_TOKEN تنظیم نشده‌اند.")
-        return
+        raise ValueError("API_ID / API_HASH / BOT_TOKEN تنظیم نشده‌اند.")
 
+    load_all_states(data_manager)
+    sessions = data_manager.get_all_sessions()
+    manager_bot = create_manager_bot()
     register_manager_handlers(manager_bot, start_bot_instance)
-    for phone, session_data in data_manager.get_all_sessions():
-        asyncio.create_task(start_bot_instance(session_data["string"], phone, session_data["user_id"]))
-
-    await manager_bot.start()
-    logging.info("✅ Manager bot started")
-    await idle()
+    cleanup_task = None
+    try:
+        await manager_bot.start()
+        cleanup_task = asyncio.create_task(cache_cleanup_loop(data_manager))
+        for phone, session_data in sessions:
+            try:
+                await start_bot_instance(session_data["string"], phone, session_data["user_id"])
+            except Exception as exc:
+                logging.error("Account %s startup failed: %s", session_data["user_id"], type(exc).__name__)
+        logging.info("Manager bot started")
+        await idle()
+    finally:
+        if cleanup_task:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+        for user_id in list(ACTIVE_BOTS):
+            await stop_active_bot(user_id)
+        from app.state import LOGIN_STATES
+        for login in list(LOGIN_STATES.values()):
+            if login.get("timeout_task"):
+                login["timeout_task"].cancel()
+            try:
+                await login["client"].disconnect()
+            except Exception:
+                pass
+        LOGIN_STATES.clear()
+        if getattr(manager_bot, "is_connected", False):
+            await manager_bot.stop()
 
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())

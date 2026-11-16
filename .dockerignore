@@ -1,0 +1,10 @@
+.git
+.venv
+.env*
+*.db*
+*.session*
+private-cache
+work
+data
+__pycache__
+.pytest_cache

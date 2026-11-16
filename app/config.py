@@ -3,12 +3,25 @@ import re
 from zoneinfo import ZoneInfo
 
 # ==== تنظیمات حساس از Environment Variables ====
-API_ID = int(os.environ.get("API_ID", "0"))
+def _positive_int(value: str, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+API_ID = _positive_int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+def _parse_ids(value: str):
+    return [int(x.strip()) for x in value.split(",") if x.strip().lstrip("+").isdigit()]
+
+
 _god_admin_env = os.environ.get("GOD_ADMIN_IDS", "")
-GOD_ADMIN_IDS = [int(x) for x in _god_admin_env.split(",") if x.strip().isdigit()]
+GOD_ADMIN_IDS = _parse_ids(_god_admin_env)
+ALLOWED_USER_IDS = _parse_ids(os.environ.get("ALLOWED_USER_IDS", "")) or list(GOD_ADMIN_IDS)
 
 # ==== دستیار AI ====
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -26,7 +39,7 @@ AI_SYSTEM_PROMPT = (
 
 # ==== مسیرهای پایدار روی Railway Volume ====
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+DATA_DIR = os.path.abspath(os.environ.get("DATA_DIR", BASE_DIR))
 DATA_FILE = os.path.join(DATA_DIR, "bot_data.db")
 PRIVATE_CACHE_DIR = os.path.join(DATA_DIR, "private-cache")
 WORK_DIR = os.path.join(DATA_DIR, "work")
@@ -35,7 +48,11 @@ PANEL_PHOTO_PATH = os.path.join(BASE_DIR, "bot.jpg")
 PERSIAN_FONT_PATH = os.path.join(BASE_DIR, "Vazirmatn-Regular.ttf")
 
 for _d in (DATA_DIR, PRIVATE_CACHE_DIR, WORK_DIR):
-    os.makedirs(_d, exist_ok=True)
+    os.makedirs(_d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(_d, 0o700)
+    except OSError:
+        pass
 
 # ==== سقف‌های کش ذخیره پیوی (Railway) ====
 MAX_CACHE_FILE_BYTES = 50 * 1024 * 1024       # ۵۰ مگابایت برای هر فایل
@@ -117,7 +134,7 @@ COMMAND_REGEX = (
     r"تاریخ خاموش|خاموش|date off|"
     r"قیمت ارز|price|فال|fall|بیو رندوم|random bio|تاریخ امروز|today's date|رم|"
     r"گیممم|Play|/fonet-> .*|/like-> .*|/getgif .*|/getpic .*|/getmeme .*|/serchgoogle .*|/youtube .*|"
-    r"دستیار روشن|دستیار خاموش|تست هوش مصنوعی|ساخت ورد .*|ساخت پی دی اف .*|"
+    r"دستیار روشن|دستیار خاموش|تست هوش مصنوعی|"
     r"\.ربات(?:\s+.*)?|\.id|\.ایدی|\.ping|\.پینگ|\.ویس(?:\s+.*)?|\.اهنگ(?:\s+.*)?|\.آهنگ(?:\s+.*)?|"
     r"ذخیره پیوی روشن|ذخیره پیوی خاموش|آنتی حذف روشن|آنتی حذف خاموش"
     r")$"

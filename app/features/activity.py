@@ -11,6 +11,11 @@ from app.state import (
 from app.storage.db import data_manager
 
 
+# Only chats explicitly selected by a command receive activity; never scan dialogs.
+ACTIVITY_CHAT_TARGETS = {}
+ACTIVITY_TARGET_TTL = 300
+
+
 async def status_action_task(client, user_id: int):
     chat_ids = []
     last_fetch = 0
@@ -22,14 +27,10 @@ async def status_action_task(client, user_id: int):
                 await asyncio.sleep(2)
                 continue
             action = ChatAction.TYPING if typing else ChatAction.PLAYING
-            now = time.time()
-            if not chat_ids or (now - last_fetch > 300):
-                new_chats = []
-                async for dialog in client.get_dialogs(limit=10):
-                    if dialog.chat.type in [ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP]:
-                        new_chats.append(dialog.chat.id)
-                chat_ids = new_chats
-                last_fetch = now
+            now = time.monotonic()
+            targets = ACTIVITY_CHAT_TARGETS.get(user_id, {})
+            chat_ids = [chat_id for chat_id, expires in targets.items() if expires > now][:5]
+            ACTIVITY_CHAT_TARGETS[user_id] = {chat_id: targets[chat_id] for chat_id in chat_ids}
             for chat_id in chat_ids:
                 try:
                     await client.send_chat_action(chat_id, action)
@@ -76,6 +77,10 @@ async def activity_mode_toggle_handler(client, message):
     user_id = client.me.id
     text = message.text
     is_on = "روشن" in text
+    if is_on:
+        ACTIVITY_CHAT_TARGETS[user_id] = {message.chat.id: time.monotonic() + ACTIVITY_TARGET_TTL}
+    else:
+        ACTIVITY_CHAT_TARGETS.pop(user_id, None)
     if text.startswith("تایپینگ"):
         TYPING_MODE_STATUS[user_id] = is_on
         if is_on:

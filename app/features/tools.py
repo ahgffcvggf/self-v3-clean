@@ -10,7 +10,7 @@ import aiohttp
 from pyrogram import ContinuePropagation
 from pyrogram.enums import ChatType
 from pyrogram.raw import functions
-from app.config import COMMAND_REGEX, UI_DIVIDER, ui_err, ui_ok, ui_toggle
+from app.config import COMMAND_REGEX, TEHRAN_TIMEZONE, UI_DIVIDER, ui_err, ui_ok, ui_toggle
 from app.state import (
     ACTIVE_ENEMIES, AUTO_REACTION_TARGETS, AUTO_TRANSLATE_TARGET,
     BOLD_MODE_STATUS, CHAR_MODE_STATUS, CLOCK_STATUS, COMMENT_MODE_STATUS,
@@ -154,6 +154,42 @@ async def reply_based_controller(client, message):
     user_id = client.me.id
     cmd = message.text
     if cmd is None:
+        raise ContinuePropagation
+
+    if cmd.startswith(("حذف ", "تکرار ")):
+        maximum = 1000 if cmd.startswith("حذف ") else 20
+        parts = cmd.split()
+        if len(parts) != 2 or not parts[1].isdecimal() or not 1 <= int(parts[1]) <= maximum:
+            await message.edit_text(ui_err(f"تعداد باید بین 1 و {maximum} باشد."))
+            return
+
+    if cmd.startswith("حذف "):
+        try:
+            count = int(cmd.split()[1])
+            msg_ids = [
+                m.id async for m in client.get_chat_history(message.chat.id, limit=count, offset_id=message.id)
+                if m.id != message.id and m.from_user and m.from_user.is_self
+            ]
+            for offset in range(0, len(msg_ids), 100):
+                await client.delete_messages(message.chat.id, msg_ids[offset:offset + 100])
+            await message.delete()
+        except Exception:
+            await message.edit_text(ui_err("حذف کامل نشد؛ ممکن است بخشی از پیام‌ها حذف شده باشند."))
+        return
+
+    if cmd == "کپی خاموش":
+        data = ORIGINAL_PROFILE_DATA.get(user_id)
+        if not data:
+            await message.edit_text(ui_err("نسخه پشتیبان پروفایل موجود نیست."))
+            return
+        try:
+            await client.update_profile(**data)
+        except Exception:
+            await message.edit_text(ui_err("بازگردانی پروفایل ناموفق بود؛ دوباره تلاش کنید."))
+            return
+        COPY_MODE_STATUS[user_id] = False
+        data_manager.update_user_data(user_id, {"settings": {"copy_mode": False}})
+        await message.edit_text(ui_ok("نام و بیوی اصلی بازگردانده شد."))
         return
 
     if cmd == "تاس":
@@ -168,52 +204,46 @@ async def reply_based_controller(client, message):
     elif cmd == "لیست دشمن":
         await message.edit_text(f"تعداد دشمنان فعال: {len(ACTIVE_ENEMIES.get(user_id, set()))}")
     elif message.reply_to_message:
+        handled = (cmd in {"ذخیره", "کپی روشن", "کپی خاموش", "دشمن روشن", "دشمن خاموش", "بلاک روشن", "بلاک خاموش", "سکوت روشن", "سکوت خاموش", "ریاکشن خاموش"} or cmd.startswith(("حذف ", "تکرار ", "ریاکشن ")))
         target_id = message.reply_to_message.from_user.id if message.reply_to_message.from_user else None
 
-        if cmd.startswith("حذف "):
-            try:
-                count = int(cmd.split()[1])
-                msg_ids = [
-                    m.id async for m in client.get_chat_history(message.chat.id, limit=count)
-                    if m.from_user and m.from_user.is_self
-                ]
-                if msg_ids:
-                    await client.delete_messages(message.chat.id, msg_ids)
-                await message.delete()
-            except Exception:
-                pass
-        elif cmd == "ذخیره":
+        if cmd == "ذخیره":
             await message.reply_to_message.forward("me")
             await message.edit_text(ui_ok("پیام ذخیره شد."))
+            handled = True
         elif cmd.startswith("تکرار "):
             try:
                 count = int(cmd.split()[1])
-                for _ in range(min(count, 20)):
+                if not 1 <= count <= 20:
+                    handled = False
+                    raise ValueError("count out of range")
+                for _ in range(count):
                     await message.reply_to_message.copy(message.chat.id)
                 await message.delete()
+                handled = True
             except Exception:
                 pass
         elif target_id:
             if cmd == "کپی روشن":
-                user = await client.get_chat(target_id)
-                me = await client.get_me()
-                ORIGINAL_PROFILE_DATA[user_id] = {"first_name": me.first_name, "bio": me.bio}
+                try:
+                    user = await client.get_chat(target_id)
+                    if not COPY_MODE_STATUS.get(user_id, False):
+                        me = await client.get_chat("me")
+                        from app.features.clock import _CLOCK_ORIGINAL_LASTNAMES
+                        ORIGINAL_PROFILE_DATA[user_id] = {
+                            "first_name": me.first_name,
+                            "last_name": _CLOCK_ORIGINAL_LASTNAMES.get(user_id, me.last_name or ""),
+                            "bio": getattr(me, "bio", "") or "",
+                        }
+                        data_manager.save_original_profile(user_id, ORIGINAL_PROFILE_DATA[user_id])
+                    await client.update_profile(first_name=user.first_name, last_name=user.last_name or "", bio=(getattr(user, "bio", "") or "")[:70])
+                except Exception:
+                    await message.edit_text(ui_err("کپی نام و بیو ناموفق بود."))
+                    return
                 COPY_MODE_STATUS[user_id] = True
                 CLOCK_STATUS[user_id] = False
-                target_photos = [p async for p in client.get_chat_photos(target_id, limit=1)]
-                await client.update_profile(first_name=user.first_name, bio=(user.bio or "")[:70])
-                if target_photos:
-                    await client.set_profile_photo(photo=target_photos[0].file_id)
-                data_manager.save_original_profile(user_id, ORIGINAL_PROFILE_DATA[user_id])
                 data_manager.update_user_data(user_id, {"settings": {"copy_mode": True, "clock": False}})
-                await message.edit_text(ui_ok("هویت کاربر اعمال شد."))
-            elif cmd == "کپی خاموش":
-                if user_id in ORIGINAL_PROFILE_DATA:
-                    data = ORIGINAL_PROFILE_DATA[user_id]
-                    COPY_MODE_STATUS[user_id] = False
-                    await client.update_profile(first_name=data.get("first_name"), bio=data.get("bio"))
-                    data_manager.update_user_data(user_id, {"settings": {"copy_mode": False}})
-                    await message.edit_text(ui_ok("هویت اصلی بازگردانده شد."))
+                await message.edit_text(ui_ok("نام و بیو اعمال شد؛ تصویر پروفایل تغییر نکرد."))
             elif cmd == "دشمن روشن":
                 s = ACTIVE_ENEMIES.get(user_id, set())
                 s.add((target_id, message.chat.id))
@@ -257,6 +287,9 @@ async def reply_based_controller(client, message):
                 AUTO_REACTION_TARGETS[user_id] = t
                 data_manager.save_reactions(user_id, t)
                 await message.edit_text(ui_ok("واکنش خودکار حذف شد."))
+                handled = True
+        if not handled:
+            raise ContinuePropagation
     else:
         raise ContinuePropagation
 
@@ -285,12 +318,18 @@ async def auto_comment_handler(client, message):
     if not COMMENT_MODE_STATUS.get(user_id, False) or message.chat.type != ChatType.CHANNEL:
         return
     try:
-        peer = await client.resolve_peer(message.chat.id)
-        result = await client.invoke(functions.messages.GetDiscussionMessage(peer=peer, msg_id=message.id))
-        if result.messages:
-            dm = result.messages[0]
-            target = await client.get_chat(dm.peer_id.channel_id if hasattr(dm.peer_id, "channel_id") else dm.peer_id)
-            await client.send_message(target.id, COMMENT_TEXT.get(user_id, "کامنت تنظیم نشده"), reply_to_message_id=dm.id)
+        if hasattr(client, "get_discussion_message"):
+            dm = await client.get_discussion_message(message.chat.id, message.id)
+            if dm:
+                await client.send_message(dm.chat.id, COMMENT_TEXT.get(user_id, "کامنت تنظیم نشده"), reply_to_message_id=dm.id)
+        else:
+            peer = await client.resolve_peer(message.chat.id)
+            result = await client.invoke(functions.messages.GetDiscussionMessage(peer=peer, msg_id=message.id))
+            if result.messages:
+                dm = result.messages[0]
+                from pyrogram.utils import get_peer_id
+                target_id = get_peer_id(dm.peer_id)
+                await client.send_message(target_id, COMMENT_TEXT.get(user_id, "کامنت تنظیم نشده"), reply_to_message_id=dm.id)
     except Exception as e:
         logging.error(f"Comment-bot error: {e}")
 
@@ -332,7 +371,7 @@ async def send_random_bio_handler(client, message):
 
 
 async def send_gregorian_date_handler(client, message):
-    now = datetime.utcnow()
+    now = datetime.now(TEHRAN_TIMEZONE)
     await message.edit_text(
         f"**تاریخ و ساعت امروز**\n{UI_DIVIDER}\n"
         f"روز: {now.strftime('%A')}\nتاریخ: {now.strftime('%Y/%m/%d')}\n"
